@@ -9,6 +9,9 @@
 (define-constant minimum-delay u120)
 (define-constant policy-price u100000000)
 (define-constant payout-amount u300000000)
+(define-constant err-invalid-tier (err u107))
+(define-constant err-invalid-score (err u108))
+(define-constant err-claim-not-ready (err u109))
 
 (define-data-var oracle-address principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM)
 
@@ -149,5 +152,194 @@
             claimed: false,
             active: false,
         }))
+    )
+)
+
+(define-constant tier-basic-multiplier u100)
+(define-constant tier-standard-multiplier u150)
+(define-constant tier-premium-multiplier u200)
+
+(define-map route-risk-tiers
+    { route: (string-ascii 20) }
+    { risk-tier: uint }
+)
+
+(define-map airline-reliability
+    { airline-code: (string-ascii 5) }
+    { reliability-score: uint }
+)
+
+(define-public (set-route-risk-tier
+        (route (string-ascii 20))
+        (risk-tier uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= risk-tier u3) (err u107))
+        (ok (map-set route-risk-tiers { route: route } { risk-tier: risk-tier }))
+    )
+)
+
+(define-public (set-airline-reliability
+        (airline-code (string-ascii 5))
+        (reliability-score uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= reliability-score u100) (err u108))
+        (ok (map-set airline-reliability { airline-code: airline-code } { reliability-score: reliability-score }))
+    )
+)
+
+(define-read-only (calculate-premium
+        (route (string-ascii 20))
+        (airline-code (string-ascii 5))
+    )
+    (let (
+            (route-data (map-get? route-risk-tiers { route: route }))
+            (airline-data (map-get? airline-reliability { airline-code: airline-code }))
+            (base-tier (if (is-some route-data)
+                (get risk-tier (unwrap-panic route-data))
+                u1
+            ))
+            (reliability (if (is-some airline-data)
+                (get reliability-score (unwrap-panic airline-data))
+                u50
+            ))
+            (tier-multiplier (if (is-eq base-tier u1)
+                tier-basic-multiplier
+                (if (is-eq base-tier u2)
+                    tier-standard-multiplier
+                    tier-premium-multiplier
+                )
+            ))
+            (reliability-adjustment (if (>= reliability u80)
+                u90
+                (if (>= reliability u60)
+                    u100
+                    u120
+                )
+            ))
+        )
+        (/ (* (* policy-price tier-multiplier) reliability-adjustment) u10000)
+    )
+)
+
+(define-public (purchase-tiered-policy
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+        (route (string-ascii 20))
+        (airline-code (string-ascii 5))
+    )
+    (let (
+            (existing-policy (get-policy flight-number departure-time))
+            (calculated-premium (calculate-premium route airline-code))
+        )
+        (asserts! (is-none existing-policy) err-policy-exists)
+        (try! (stx-transfer? calculated-premium tx-sender contract-owner))
+        (ok (map-set flight-policies {
+            flight-number: flight-number,
+            departure-time: departure-time,
+        } {
+            owner: tx-sender,
+            delay-minutes: u0,
+            claimed: false,
+            active: true,
+        }))
+    )
+)
+(define-constant auto-claim-window u144)
+
+(define-map pending-auto-claims
+    {
+        flight-number: (string-ascii 10),
+        departure-time: uint,
+    }
+    {
+        eligible-block: uint,
+        processed: bool,
+    }
+)
+
+(define-public (trigger-auto-claim-eligibility
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+    )
+    (let (
+            (policy (unwrap! (get-policy flight-number departure-time) err-no-policy))
+            (delay (get delay-minutes policy))
+        )
+        (asserts! (>= delay minimum-delay) err-not-claimable)
+        (asserts! (not (get claimed policy)) err-already-claimed)
+        (ok (map-set pending-auto-claims {
+            flight-number: flight-number,
+            departure-time: departure-time,
+        } {
+            eligible-block: (+ burn-block-height auto-claim-window),
+            processed: false,
+        }))
+    )
+)
+
+(define-public (execute-auto-claim
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+    )
+    (let (
+            (policy (unwrap! (get-policy flight-number departure-time) err-no-policy))
+            (auto-claim (unwrap!
+                (map-get? pending-auto-claims {
+                    flight-number: flight-number,
+                    departure-time: departure-time,
+                })
+                err-no-policy
+            ))
+            (policy-owner (get owner policy))
+        )
+        (asserts! (>= burn-block-height (get eligible-block auto-claim))
+            (err u109)
+        )
+        (asserts! (not (get processed auto-claim)) err-already-claimed)
+        (asserts! (not (get claimed policy)) err-already-claimed)
+        (try! (stx-transfer? payout-amount contract-owner policy-owner))
+        (map-set pending-auto-claims {
+            flight-number: flight-number,
+            departure-time: departure-time,
+        } {
+            eligible-block: (get eligible-block auto-claim),
+            processed: true,
+        })
+        (ok (map-set flight-policies {
+            flight-number: flight-number,
+            departure-time: departure-time,
+        } {
+            owner: policy-owner,
+            delay-minutes: (get delay-minutes policy),
+            claimed: true,
+            active: false,
+        }))
+    )
+)
+
+(define-read-only (get-auto-claim-status
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+    )
+    (map-get? pending-auto-claims {
+        flight-number: flight-number,
+        departure-time: departure-time,
+    })
+)
+
+(define-read-only (is-auto-claim-ready
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+    )
+    (match (get-auto-claim-status flight-number departure-time)
+        auto-claim (and
+            (>= burn-block-height (get eligible-block auto-claim))
+            (not (get processed auto-claim))
+        )
+        false
     )
 )
