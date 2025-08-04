@@ -12,6 +12,9 @@
 (define-constant err-invalid-tier (err u107))
 (define-constant err-invalid-score (err u108))
 (define-constant err-claim-not-ready (err u109))
+(define-constant err-mismatched-lists (err u110))
+(define-constant err-invalid-bundle-size (err u111))
+(define-constant err-bundle-too-large (err u112))
 
 (define-data-var oracle-address principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM)
 
@@ -342,4 +345,201 @@
         )
         false
     )
+)
+
+(define-constant bundle-discount-2 u95)
+(define-constant bundle-discount-3 u90)
+(define-constant bundle-discount-5 u85)
+(define-constant max-bundle-size u10)
+
+(define-map bundle-policies
+    { bundle-id: uint }
+    {
+        owner: principal,
+        policy-count: uint,
+        created-at: uint,
+    }
+)
+
+(define-data-var bundle-counter uint u0)
+
+(define-map bundle-policy-details
+    {
+        bundle-id: uint,
+        policy-index: uint,
+    }
+    {
+        flight-number: (string-ascii 10),
+        departure-time: uint,
+        premium-paid: uint,
+    }
+)
+
+(define-read-only (calculate-bundle-discount (policy-count uint))
+    (if (>= policy-count u5)
+        bundle-discount-5
+        (if (>= policy-count u3)
+            bundle-discount-3
+            (if (>= policy-count u2)
+                bundle-discount-2
+                u100
+            )
+        )
+    )
+)
+
+(define-public (purchase-bundle-policy
+        (flight-numbers (list 10 (string-ascii 10)))
+        (departure-times (list 10 uint))
+        (routes (list 10 (string-ascii 20)))
+        (airline-codes (list 10 (string-ascii 5)))
+    )
+    (let (
+            (policy-count (len flight-numbers))
+            (bundle-id (+ (var-get bundle-counter) u1))
+        )
+        (asserts! (is-eq policy-count (len departure-times)) err-mismatched-lists)
+        (asserts! (is-eq policy-count (len routes)) err-mismatched-lists)
+        (asserts! (is-eq policy-count (len airline-codes)) err-mismatched-lists)
+        (asserts! (> policy-count u1) err-invalid-bundle-size)
+        (asserts! (<= policy-count max-bundle-size) err-bundle-too-large)
+        (try! (process-bundle-purchase bundle-id flight-numbers departure-times routes
+            airline-codes policy-count
+        ))
+        (var-set bundle-counter bundle-id)
+        (ok bundle-id)
+    )
+)
+
+(define-private (process-bundle-purchase
+        (bundle-id uint)
+        (flight-numbers (list 10 (string-ascii 10)))
+        (departure-times (list 10 uint))
+        (routes (list 10 (string-ascii 20)))
+        (airline-codes (list 10 (string-ascii 5)))
+        (policy-count uint)
+    )
+    (let (
+            (discount-multiplier (calculate-bundle-discount policy-count))
+            (total-premium (fold calculate-and-sum-premiums
+                (zip flight-numbers departure-times routes airline-codes) u0
+            ))
+            (discounted-total (/ (* total-premium discount-multiplier) u100))
+        )
+        (try! (stx-transfer? discounted-total tx-sender contract-owner))
+        (fold process-single-bundle-policy
+            (zip flight-numbers departure-times routes airline-codes) {
+            bundle-id: bundle-id,
+            index: u0,
+            success: true,
+        })
+        (ok (map-set bundle-policies { bundle-id: bundle-id } {
+            owner: tx-sender,
+            policy-count: policy-count,
+            created-at: burn-block-height,
+        }))
+    )
+)
+
+(define-private (calculate-and-sum-premiums
+        (policy-data {
+            flight-number: (string-ascii 10),
+            departure-time: uint,
+            route: (string-ascii 20),
+            airline-code: (string-ascii 5),
+        })
+        (accumulator uint)
+    )
+    (+ accumulator
+        (calculate-premium (get route policy-data) (get airline-code policy-data))
+    )
+)
+
+(define-private (process-single-bundle-policy
+        (policy-data {
+            flight-number: (string-ascii 10),
+            departure-time: uint,
+            route: (string-ascii 20),
+            airline-code: (string-ascii 5),
+        })
+        (state {
+            bundle-id: uint,
+            index: uint,
+            success: bool,
+        })
+    )
+    (let (
+            (flight-number (get flight-number policy-data))
+            (departure-time (get departure-time policy-data))
+            (route (get route policy-data))
+            (airline-code (get airline-code policy-data))
+            (bundle-id (get bundle-id state))
+            (current-index (get index state))
+            (premium (calculate-premium route airline-code))
+        )
+        (if (get success state)
+            (begin
+                (map-set flight-policies {
+                    flight-number: flight-number,
+                    departure-time: departure-time,
+                } {
+                    owner: tx-sender,
+                    delay-minutes: u0,
+                    claimed: false,
+                    active: true,
+                })
+                (map-set bundle-policy-details {
+                    bundle-id: bundle-id,
+                    policy-index: current-index,
+                } {
+                    flight-number: flight-number,
+                    departure-time: departure-time,
+                    premium-paid: premium,
+                })
+                {
+                    bundle-id: bundle-id,
+                    index: (+ current-index u1),
+                    success: true,
+                }
+            )
+            state
+        )
+    )
+)
+
+(define-private (zip
+        (list1 (list 10 (string-ascii 10)))
+        (list2 (list 10 uint))
+        (list3 (list 10 (string-ascii 20)))
+        (list4 (list 10 (string-ascii 5)))
+    )
+    (map combine-elements list1 list2 list3 list4)
+)
+
+(define-private (combine-elements
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+        (route (string-ascii 20))
+        (airline-code (string-ascii 5))
+    )
+    {
+        flight-number: flight-number,
+        departure-time: departure-time,
+        route: route,
+        airline-code: airline-code,
+    }
+)
+
+(define-read-only (get-bundle-info (bundle-id uint))
+    (map-get? bundle-policies { bundle-id: bundle-id })
+)
+
+(define-read-only (get-bundle-policy-details
+        (bundle-id uint)
+        (policy-index uint)
+    )
+    (map-get? bundle-policy-details {
+        bundle-id: bundle-id,
+        policy-index: policy-index,
+    })
 )
