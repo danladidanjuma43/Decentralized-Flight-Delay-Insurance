@@ -15,6 +15,10 @@
 (define-constant err-mismatched-lists (err u110))
 (define-constant err-invalid-bundle-size (err u111))
 (define-constant err-bundle-too-large (err u112))
+(define-constant err-not-transferable (err u113))
+(define-constant err-invalid-transfer-price (err u114))
+(define-constant err-transfer-not-found (err u115))
+(define-constant err-cannot-transfer-to-self (err u116))
 
 (define-data-var oracle-address principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM)
 
@@ -542,4 +546,133 @@
         bundle-id: bundle-id,
         policy-index: policy-index,
     })
+)
+
+(define-constant transfer-fee-percentage u5)
+
+(define-map policy-transfers
+    {
+        flight-number: (string-ascii 10),
+        departure-time: uint,
+    }
+    {
+        seller: principal,
+        transfer-price: uint,
+        listed-at: uint,
+        expires-at: uint,
+    }
+)
+
+(define-public (list-policy-for-transfer
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+        (transfer-price uint)
+        (expires-after-blocks uint)
+    )
+    (let (
+            (policy (unwrap! (get-policy flight-number departure-time) err-no-policy))
+            (current-block burn-block-height)
+        )
+        (asserts! (is-eq (get owner policy) tx-sender) err-owner-only)
+        (asserts! (get active policy) err-not-transferable)
+        (asserts! (not (get claimed policy)) err-already-claimed)
+        (asserts! (> transfer-price u0) err-invalid-transfer-price)
+        (asserts! (> expires-after-blocks u0) err-invalid-transfer-price)
+        (ok (map-set policy-transfers {
+            flight-number: flight-number,
+            departure-time: departure-time,
+        } {
+            seller: tx-sender,
+            transfer-price: transfer-price,
+            listed-at: current-block,
+            expires-at: (+ current-block expires-after-blocks),
+        }))
+    )
+)
+
+(define-public (purchase-transferred-policy
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+    )
+    (let (
+            (policy (unwrap! (get-policy flight-number departure-time) err-no-policy))
+            (transfer-listing (unwrap!
+                (map-get? policy-transfers {
+                    flight-number: flight-number,
+                    departure-time: departure-time,
+                })
+                err-transfer-not-found
+            ))
+            (seller (get seller transfer-listing))
+            (transfer-price (get transfer-price transfer-listing))
+            (transfer-fee (/ (* transfer-price transfer-fee-percentage) u100))
+            (seller-amount (- transfer-price transfer-fee))
+        )
+        (asserts! (not (is-eq tx-sender seller)) err-cannot-transfer-to-self)
+        (asserts! (<= burn-block-height (get expires-at transfer-listing))
+            err-transfer-not-found
+        )
+        (asserts! (get active policy) err-not-transferable)
+        (asserts! (not (get claimed policy)) err-already-claimed)
+        (try! (stx-transfer? seller-amount tx-sender seller))
+        (try! (stx-transfer? transfer-fee tx-sender contract-owner))
+        (map-delete policy-transfers {
+            flight-number: flight-number,
+            departure-time: departure-time,
+        })
+        (ok (map-set flight-policies {
+            flight-number: flight-number,
+            departure-time: departure-time,
+        } {
+            owner: tx-sender,
+            delay-minutes: (get delay-minutes policy),
+            claimed: false,
+            active: true,
+        }))
+    )
+)
+
+(define-public (cancel-policy-transfer
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+    )
+    (let ((transfer-listing (unwrap!
+            (map-get? policy-transfers {
+                flight-number: flight-number,
+                departure-time: departure-time,
+            })
+            err-transfer-not-found
+        )))
+        (asserts! (is-eq tx-sender (get seller transfer-listing)) err-owner-only)
+        (ok (map-delete policy-transfers {
+            flight-number: flight-number,
+            departure-time: departure-time,
+        }))
+    )
+)
+
+(define-read-only (get-policy-transfer-listing
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+    )
+    (map-get? policy-transfers {
+        flight-number: flight-number,
+        departure-time: departure-time,
+    })
+)
+
+(define-read-only (is-transfer-listing-active
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+    )
+    (match (get-policy-transfer-listing flight-number departure-time)
+        transfer-listing (and
+            (<= burn-block-height (get expires-at transfer-listing))
+            (match (get-policy flight-number departure-time)
+                policy (and (get active policy) (not (get claimed policy)))
+                false
+            )
+        )
+        false
+    )
 )
