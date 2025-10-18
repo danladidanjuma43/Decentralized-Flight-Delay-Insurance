@@ -19,6 +19,10 @@
 (define-constant err-invalid-transfer-price (err u114))
 (define-constant err-transfer-not-found (err u115))
 (define-constant err-cannot-transfer-to-self (err u116))
+(define-constant err-insufficient-stake (err u117))
+(define-constant err-no-stake-found (err u118))
+(define-constant err-insufficient-pool-balance (err u119))
+(define-constant err-cooldown-active (err u120))
 
 (define-data-var oracle-address principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM)
 
@@ -671,6 +675,176 @@
             (match (get-policy flight-number departure-time)
                 policy (and (get active policy) (not (get claimed policy)))
                 false
+            )
+        )
+        false
+    )
+)
+
+(define-constant minimum-stake u1000000000)
+(define-constant unstake-cooldown u144)
+(define-constant staker-premium-share u40)
+
+(define-data-var total-pool-balance uint u0)
+(define-data-var total-staked uint u0)
+
+(define-map stakers
+    { staker: principal }
+    {
+        amount-staked: uint,
+        last-stake-block: uint,
+        rewards-earned: uint,
+        unstake-requested-at: uint,
+    }
+)
+
+(define-map pool-metrics
+    { epoch: uint }
+    {
+        total-premiums-collected: uint,
+        total-claims-paid: uint,
+        stakers-count: uint,
+    }
+)
+
+(define-data-var current-epoch uint u0)
+
+(define-public (stake-in-pool (amount uint))
+    (let (
+            (existing-stake (map-get? stakers { staker: tx-sender }))
+            (current-staked (if (is-some existing-stake)
+                (get amount-staked (unwrap-panic existing-stake))
+                u0
+            ))
+            (current-rewards (if (is-some existing-stake)
+                (get rewards-earned (unwrap-panic existing-stake))
+                u0
+            ))
+        )
+        (asserts! (>= amount minimum-stake) err-insufficient-stake)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set total-staked (+ (var-get total-staked) amount))
+        (var-set total-pool-balance (+ (var-get total-pool-balance) amount))
+        (ok (map-set stakers { staker: tx-sender } {
+            amount-staked: (+ current-staked amount),
+            last-stake-block: burn-block-height,
+            rewards-earned: current-rewards,
+            unstake-requested-at: u0,
+        }))
+    )
+)
+
+(define-public (request-unstake)
+    (let ((stake-data (unwrap! (map-get? stakers { staker: tx-sender }) err-no-stake-found)))
+        (asserts! (> (get amount-staked stake-data) u0) err-insufficient-stake)
+        (asserts! (is-eq (get unstake-requested-at stake-data) u0)
+            err-cooldown-active
+        )
+        (ok (map-set stakers { staker: tx-sender } {
+            amount-staked: (get amount-staked stake-data),
+            last-stake-block: (get last-stake-block stake-data),
+            rewards-earned: (get rewards-earned stake-data),
+            unstake-requested-at: burn-block-height,
+        }))
+    )
+)
+
+(define-public (execute-unstake)
+    (let (
+            (stake-data (unwrap! (map-get? stakers { staker: tx-sender }) err-no-stake-found))
+            (requested-at (get unstake-requested-at stake-data))
+            (staked-amount (get amount-staked stake-data))
+            (rewards (get rewards-earned stake-data))
+            (total-withdrawal (+ staked-amount rewards))
+        )
+        (asserts! (> requested-at u0) err-cooldown-active)
+        (asserts! (>= burn-block-height (+ requested-at unstake-cooldown))
+            err-cooldown-active
+        )
+        (asserts! (>= (var-get total-pool-balance) total-withdrawal)
+            err-insufficient-pool-balance
+        )
+        (try! (as-contract (stx-transfer? total-withdrawal tx-sender tx-sender)))
+        (var-set total-staked (- (var-get total-staked) staked-amount))
+        (var-set total-pool-balance
+            (- (var-get total-pool-balance) total-withdrawal)
+        )
+        (ok (map-delete stakers { staker: tx-sender }))
+    )
+)
+
+(define-public (distribute-premium-to-stakers (premium-amount uint))
+    (let (
+            (staker-share (/ (* premium-amount staker-premium-share) u100))
+            (pool-share (- premium-amount staker-share))
+        )
+        (var-set total-pool-balance (+ (var-get total-pool-balance) pool-share))
+        (ok staker-share)
+    )
+)
+
+(define-public (claim-staker-rewards)
+    (let (
+            (stake-data (unwrap! (map-get? stakers { staker: tx-sender }) err-no-stake-found))
+            (rewards (get rewards-earned stake-data))
+        )
+        (asserts! (> rewards u0) err-insufficient-stake)
+        (asserts! (>= (var-get total-pool-balance) rewards)
+            err-insufficient-pool-balance
+        )
+        (try! (as-contract (stx-transfer? rewards tx-sender tx-sender)))
+        (var-set total-pool-balance (- (var-get total-pool-balance) rewards))
+        (ok (map-set stakers { staker: tx-sender } {
+            amount-staked: (get amount-staked stake-data),
+            last-stake-block: (get last-stake-block stake-data),
+            rewards-earned: u0,
+            unstake-requested-at: (get unstake-requested-at stake-data),
+        }))
+    )
+)
+
+(define-public (allocate-rewards-to-staker
+        (staker principal)
+        (reward-amount uint)
+    )
+    (let ((stake-data (unwrap! (map-get? stakers { staker: staker }) err-no-stake-found)))
+        (ok (map-set stakers { staker: staker } {
+            amount-staked: (get amount-staked stake-data),
+            last-stake-block: (get last-stake-block stake-data),
+            rewards-earned: (+ (get rewards-earned stake-data) reward-amount),
+            unstake-requested-at: (get unstake-requested-at stake-data),
+        }))
+    )
+)
+
+(define-read-only (get-staker-info (staker principal))
+    (map-get? stakers { staker: staker })
+)
+
+(define-read-only (get-pool-stats)
+    {
+        total-pool-balance: (var-get total-pool-balance),
+        total-staked: (var-get total-staked),
+        current-epoch: (var-get current-epoch),
+    }
+)
+
+(define-read-only (calculate-staker-share (staker principal))
+    (match (map-get? stakers { staker: staker })
+        stake-data (if (> (var-get total-staked) u0)
+            (/ (* (get amount-staked stake-data) u10000) (var-get total-staked))
+            u0
+        )
+        u0
+    )
+)
+
+(define-read-only (is-unstake-ready (staker principal))
+    (match (map-get? stakers { staker: staker })
+        stake-data (let ((requested-at (get unstake-requested-at stake-data)))
+            (and
+                (> requested-at u0)
+                (>= burn-block-height (+ requested-at unstake-cooldown))
             )
         )
         false
