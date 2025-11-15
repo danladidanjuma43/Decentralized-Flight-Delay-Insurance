@@ -146,6 +146,37 @@
     )
 )
 
+(define-public (claim-insurance-from-pool
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+    )
+    (let (
+            (policy (unwrap! (get-policy flight-number departure-time) err-no-policy))
+            (delay (get delay-minutes policy))
+            (policy-owner (get owner policy))
+        )
+        (asserts! (is-eq policy-owner tx-sender) err-owner-only)
+        (asserts! (not (get claimed policy)) err-already-claimed)
+        (asserts! (>= delay minimum-delay) err-not-claimable)
+        (asserts! (>= (var-get total-pool-balance) payout-amount)
+            err-insufficient-pool-balance
+        )
+        (try! (as-contract (stx-transfer? payout-amount tx-sender policy-owner)))
+        (var-set total-pool-balance
+            (- (var-get total-pool-balance) payout-amount)
+        )
+        (ok (map-set flight-policies {
+            flight-number: flight-number,
+            departure-time: departure-time,
+        } {
+            owner: policy-owner,
+            delay-minutes: delay,
+            claimed: true,
+            active: false,
+        }))
+    )
+)
+
 (define-public (cancel-policy
         (flight-number (string-ascii 10))
         (departure-time uint)
@@ -313,6 +344,52 @@
         (asserts! (not (get processed auto-claim)) err-already-claimed)
         (asserts! (not (get claimed policy)) err-already-claimed)
         (try! (stx-transfer? payout-amount contract-owner policy-owner))
+        (map-set pending-auto-claims {
+            flight-number: flight-number,
+            departure-time: departure-time,
+        } {
+            eligible-block: (get eligible-block auto-claim),
+            processed: true,
+        })
+        (ok (map-set flight-policies {
+            flight-number: flight-number,
+            departure-time: departure-time,
+        } {
+            owner: policy-owner,
+            delay-minutes: (get delay-minutes policy),
+            claimed: true,
+            active: false,
+        }))
+    )
+)
+
+(define-public (execute-auto-claim-from-pool
+        (flight-number (string-ascii 10))
+        (departure-time uint)
+    )
+    (let (
+            (policy (unwrap! (get-policy flight-number departure-time) err-no-policy))
+            (auto-claim (unwrap!
+                (map-get? pending-auto-claims {
+                    flight-number: flight-number,
+                    departure-time: departure-time,
+                })
+                err-no-policy
+            ))
+            (policy-owner (get owner policy))
+        )
+        (asserts! (>= burn-block-height (get eligible-block auto-claim))
+            err-claim-not-ready
+        )
+        (asserts! (not (get processed auto-claim)) err-already-claimed)
+        (asserts! (not (get claimed policy)) err-already-claimed)
+        (asserts! (>= (var-get total-pool-balance) payout-amount)
+            err-insufficient-pool-balance
+        )
+        (try! (as-contract (stx-transfer? payout-amount tx-sender policy-owner)))
+        (var-set total-pool-balance
+            (- (var-get total-pool-balance) payout-amount)
+        )
         (map-set pending-auto-claims {
             flight-number: flight-number,
             departure-time: departure-time,
